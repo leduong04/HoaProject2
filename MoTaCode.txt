@@ -1,0 +1,136 @@
+Phân tích thiết kế chi tiết - Module CRUD Hợp đồng thuê xe (FastAPI)
+
+1) Mục tiêu & phạm vi
+- Xây dựng module quản lý hợp đồng (Contract) đáp ứng CRUD theo tài liệu yêu cầu.
+- Kết nối PostgreSQL, ánh xạ bảng hiện có (theo DDL trong motanhiemvu.md) bằng SQLAlchemy 2.x.
+- Cung cấp các endpoint REST: /contracts (list, create), /contracts/{id} (read/update/delete).
+- Thêm các endpoint kiểm tra sức khỏe và một trang nháp HTML để xem dữ liệu DB nhanh.
+
+2) Kiến trúc tổng quan
+- Framework: FastAPI (app/main.py tạo ứng dụng và gắn router).
+- ORM: SQLAlchemy 2.x (app/database.py, app/models.py).
+- Validation/Schema: Pydantic v2 (app/schemas/contract.py).
+- Router: app/routers/contracts.py chứa toàn bộ CRUD cho Contract.
+- Cấu hình DB qua biến môi trường DATABASE_URL (hỗ trợ .env với python-dotenv).
+- Không tự động create_all để tôn trọng schema đã ban hành trong DDL; yêu cầu tạo bảng trước (migration/DDL).
+
+3) Cấu hình cơ sở dữ liệu (app/database.py)
+- load_dotenv(): nạp biến môi trường từ file .env nếu có.
+- DATABASE_URL: chuỗi kết nối PostgreSQL, ví dụ: postgresql+psycopg2://user:pass@host:5432/HoaDB5
+- engine: create_engine(DATABASE_URL, pool_pre_ping=True) đảm bảo kết nối được kiểm tra trước khi dùng.
+- SessionLocal: sessionmaker(autoflush=False, autocommit=False) để quản lý phiên làm việc ORM an toàn.
+- get_db(): dependency FastAPI cung cấp session theo request, đảm bảo đóng session sau khi dùng.
+
+4) Mô hình dữ liệu ORM (app/models.py)
+- Customer
+  - Ánh xạ bảng "Customer" theo DDL: CustomerID, FullName, Phone, Email, Address, CitizenID, RegistrationDate, IsDeleted.
+  - relationships: contracts (list[Contract]) để truy ngược các hợp đồng của khách hàng.
+- Contract
+  - Ánh xạ bảng "Contract" theo DDL: ContractID, CustomerID (FK -> Customer.CustomerID), StartDate, EndDate, TotalAmount, Status, Notes.
+  - Ràng buộc: ck_contract_date_range đảm bảo EndDate >= StartDate (khi cả hai có giá trị).
+  - relationship: customer (Customer) phục vụ truy cập thuận tiện từ hợp đồng sang khách hàng.
+- Kiểu dữ liệu
+  - TotalAmount dùng Numeric(15,2) ở DB và map về float ở ORM; phía schema Pydantic dùng Decimal để giữ độ chính xác khi vào/ra API.
+
+5) Schema Pydantic (app/schemas/contract.py)
+- Thiết kế theo ba lớp: ContractCreate, ContractUpdate, ContractRead.
+- Alias field để tương thích với tên cột DB:
+  - API chấp nhận cả alias theo DB ("CustomerID", "StartDate", ...) và snake_case (customer_id, start_date, ...).
+  - model_config(populate_by_name=True, from_attributes=True) cho phép map hai chiều giữa ORM và JSON có alias.
+- Lợi ích: frontend có thể gửi nhanh theo cách đặt tên quen thuộc (snake_case), vẫn tương thích khi cần giữ đúng case của DB trong payload.
+
+6) Router CRUD (app/routers/contracts.py)
+- Danh sách (GET /contracts):
+  - Sử dụng SQLAlchemy 2.x với select(Contract) + scalars().all().
+  - Trả về mảng ContractRead; mỗi phần tử được khởi tạo từ ORM instance.
+- Tạo mới (POST /contracts):
+  - Nhận ContractCreate; chèn một bản ghi Contract; commit và trả về ContractRead.
+- Xem chi tiết (GET /contracts/{contract_id}):
+  - Sử dụng db.get(Contract, contract_id) (chuẩn 2.x) để truy xuất.
+- Cập nhật (PUT /contracts/{contract_id}):
+  - Gán có điều kiện các trường được truyền; commit và trả về ContractRead.
+- Xóa (DELETE /contracts/{contract_id}):
+  - db.get -> db.delete -> commit; trả HTTP 204 No Content.
+- Xử lý lỗi: nếu không tìm thấy, trả HTTP 404 với thông điệp tiếng Việt.
+
+7) Ứng dụng chính & tiện ích (app/main.py)
+- include_router(contracts_router) để mount /contracts.
+- GET "/": trả về meta service và các endpoint chính (docs, redoc, health, contracts) giúp điều hướng nhanh khi mở trình duyệt.
+- Sức khỏe hệ thống:
+  - GET "/health": kiểm tra nhanh ứng dụng đang chạy.
+  - GET "/health/db": thử engine.connect() và SELECT 1; trả 200 nếu thành công, 503 nếu lỗi (kèm detail gợi ý).
+- Trang nháp xem dữ liệu:
+  - GET "/_debug/db": render HTML toàn bộ bảng trong schema public (giới hạn mỗi bảng limit=200 mặc định).
+  - Query string: all=true để bỏ giới hạn; limit=... để chỉnh số dòng trên mỗi bảng.
+  - Áp dụng HTML escaping khi render để an toàn cơ bản khi hiển thị dữ liệu.
+  - Lưu ý bảo mật: chỉ dùng nội bộ/dev; không expose ở production.
+
+8) Lý do thiết kế & quyết định kỹ thuật
+- Không auto Base.metadata.create_all: tránh sai lệch giữa ORM và DDL chính thức; triển khai theo mô hình quản trị DB của team (migration riêng/DDL chuẩn).
+- Dùng SQLAlchemy 2.x API (select(), session.get()) để đồng bộ với chuẩn mới, tránh deprecation.
+- Pydantic v2 với alias để hài hòa giữa quy ước đặt tên DB (PascalCase) và API (snake_case) mà vẫn tương thích.
+- Tách layer: models (ORM), schemas (I/O), routers (HTTP). Dễ bảo trì, kiểm thử và mở rộng.
+
+9) Hướng dẫn kiểm thử nhanh
+- Kiểm tra kết nối DB: mở /health/db (200 -> ok; 503 -> xem detail và DATABASE_URL).
+- Nếu /contracts trả []: chưa có dữ liệu, hãy chèn mẫu:
+  SQL:
+    INSERT INTO Customer (FullName) VALUES ('Khach demo') RETURNING CustomerID;
+    INSERT INTO Contract (CustomerID, StartDate, EndDate, TotalAmount, Status, Notes)
+    VALUES (<customer_id>, CURRENT_DATE, CURRENT_DATE, 1200000, 'active', 'demo');
+  Gọi API:
+    GET /contracts -> nên thấy ít nhất 1 bản ghi.
+
+10) Bảo mật & vận hành
+- Không bật /_debug/db ở môi trường prod; nếu cần, bọc sau auth hoặc feature flag.
+- Kiểm soát DATABASE_URL qua biến môi trường, không commit thông tin nhạy cảm.
+- Thêm CORS, auth, rate limit (tùy yêu cầu tích hợp) ở các giai đoạn tiếp theo.
+
+11) Mở rộng trong tương lai
+- Triển khai đầy đủ các bảng còn lại theo DDL (ContractCar, ContractPayment, Surcharge, ...), bổ sung router/phối hợp giao dịch.
+- Thêm filter/sort/pagination cho GET /contracts (theo status, ngày, khách hàng...).
+- Chuẩn hóa trả lỗi (error model), logging có cấu trúc, và metrics.
+- Bổ sung migration (Alembic) để quản lý schema thay đổi theo phiên bản.
+
+12) Danh sách file chính
+- app/main.py: tạo FastAPI app, route gốc, health, health/db, _debug/db, gắn /contracts.
+- app/database.py: engine + SessionLocal + get_db, nạp .env.
+- app/models.py: ORM cho Customer, Contract (+ ràng buộc ngày hợp lệ).
+- app/schemas/contract.py: schema vào/ra cho Contract (Create/Update/Read) với alias.
+- app/routers/contracts.py: triển khai CRUD hợp đồng.
+- requirements.txt: khai báo deps (fastapi, uvicorn, SQLAlchemy, psycopg2-binary, pydantic, python-dotenv).
+- README.md: hướng dẫn chạy nhanh, liệt kê endpoint cơ bản.
+
+13) Ghi chú tương thích dữ liệu
+- Kiểu ngày: StartDate/EndDate nhận ISO-8601 (YYYY-MM-DD) từ API, map Date ở DB.
+- Số tiền: total_amount nhận/ghi Decimal, ORM lưu Numeric(15,2). Khi trả JSON qua Pydantic v2, giữ chính xác thập phân.
+- Trạng thái: Status là chuỗi mở (active/cancelled/finished ...), team có thể chuẩn hóa enum sau.
+
+
+
+14) Cách chạy thử source code (Windows - cmd)
+- Yêu cầu: cài Python 3.11+, PostgreSQL đang chạy và có DB `HoaDB5`.
+- B1. (Tùy chọn) tạo virtualenv:
+  python -m venv .venv
+  .venv\Scripts\activate
+- B2. Cài đặt phụ thuộc:
+  pip install -r requirements.txt
+- B3. Tạo file `.env` tại thư mục dự án (cùng cấp với requirements.txt), điền chuỗi kết nối:
+  DATABASE_URL=postgresql+psycopg2://<user>:<password>@<host>:<port>/HoaDB5
+- B4. Đảm bảo schema đã tồn tại theo DDL (tạo bảng `Customer`, `Contract`, ...). Nếu chưa có, áp dụng script DDL trước.
+- B5. Chạy ứng dụng:
+  uvicorn app.main:app --reload
+- B6. Kiểm tra nhanh:
+  - Mở http://127.0.0.1:8000/  (thông tin service)
+  - Mở http://127.0.0.1:8000/docs (Swagger UI)
+  - Mở http://127.0.0.1:8000/health (trạng thái app)
+  - Mở http://127.0.0.1:8000/health/db (kết nối DB)
+- B7. Thử CRUD hợp đồng:
+  - Tạo dữ liệu mẫu (trong PostgreSQL):
+    INSERT INTO Customer (FullName) VALUES ('Khach demo') RETURNING CustomerID;
+    INSERT INTO Contract (CustomerID, StartDate, EndDate, TotalAmount, Status, Notes)
+    VALUES (<customer_id>, CURRENT_DATE, CURRENT_DATE, 1200000, 'active', 'demo');
+  - Hoặc dùng API tạo hợp đồng (cmd):
+    curl -X POST http://127.0.0.1:8000/contracts -H "Content-Type: application/json" -d "{ \"customer_id\": <customer_id>, \"start_date\": \"2025-10-15\", \"end_date\": \"2025-10-16\", \"total_amount\": 1200000, \"status\": \"active\", \"notes\": \"demo\" }"
+  - Xem danh sách:
+    curl -X GET http://127.0.0.1:8000/contracts
